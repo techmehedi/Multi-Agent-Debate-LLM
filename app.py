@@ -79,7 +79,7 @@ def handle_inference_error(error: Exception, model_name: str) -> str:
     if "401" in raw or "403" in raw:
         return (
             f"Access denied for '{model_name}'. Visit the model page on "
-            "huggingface.co to accept its license/terms."
+            f"https://huggingface.co/{model_name} to accept its license/terms."
         )
     if "404" in raw:
         return f"Model '{model_name}' was not found on Hugging Face Hub."
