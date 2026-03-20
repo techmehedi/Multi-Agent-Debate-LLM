@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi-Agent Review Board</title>
+  <meta name="description" content="Multi-Agent Review Board — Multiple AI models debate and refine answers across rounds of peer review. Powered by Hugging Face Inference API." />
+  <meta name="theme-color" content="#c5dff0" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+
+  <!-- ── Toast notification ── -->
+  <div id="toast" class="toast" role="alert" aria-live="polite"></div>
+
+  <!-- ── Header ── -->
+  <header class="site-header">
+    <div class="header-glow"></div>
+    <div class="header-content">
+      <div class="header-icon">🧠</div>
+      <div class="header-text">
+        <h1>Multi-Agent <span class="gradient-text">Review Board</span></h1>
+        <p class="header-subtitle">Multiple AI models debate and refine answers across rounds of peer review</p>
+      </div>
+      <div class="header-badge">
+        <span class="badge-dot"></span>
+        Powered by HF Inference API
+      </div>
+    </div>
+  </header>
+
+  <!-- ── App Layout ── -->
+  <div class="app-layout">
+
+    <!-- ── Sidebar ── -->
+    <aside class="sidebar">
+
+      <!-- Token section -->
+      <div class="sidebar-section">
+        <h2 class="section-label">
+          <span class="section-icon">🔑</span> Authentication
+        </h2>
+        <div class="input-group">
+          <label for="hf-token" class="field-label">Hugging Face Token</label>
+          <div class="input-with-toggle">
+            <input type="password" id="hf-token" placeholder="hf_•••••••••••••••••••••••"
+              autocomplete="off" spellcheck="false" />
+            <button class="toggle-visibility" id="token-toggle" aria-label="Toggle token visibility" title="Show/hide token">
+              <svg id="eye-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              <svg id="eye-off-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+            </button>
+          </div>
+          <p class="field-hint"><a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">Get a free token →</a>  Token stays in your browser.</p>
+        </div>
+      </div>
+
+      <!-- Settings section -->
+      <div class="sidebar-section">
+        <h2 class="section-label">
+          <span class="section-icon">⚙️</span> Settings
+        </h2>
+        <div class="slider-group">
+          <div class="slider-header">
+            <label for="rounds-slider" class="field-label">Debate Rounds</label>
+            <span class="slider-value" id="rounds-value">2</span>
+          </div>
+          <input type="range" id="rounds-slider" min="1" max="10" value="2" step="1" />
+          <p class="field-hint">Round 1 = independent answers · Round 2+ = peer review</p>
+        </div>
+      </div>
+
+      <!-- Agents section -->
+      <div class="sidebar-section agents-section">
+        <h2 class="section-label">
+          <span class="section-icon">🤖</span> Agents
+          <span class="agent-count-badge" id="agent-count">2</span>
+        </h2>
+        <div id="agents-list" class="agents-list"></div>
+        <button id="add-agent-btn" class="btn-add-agent">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Agent
+        </button>
+      </div>
+
+    </aside>
+
+    <!-- ── Main Content ── -->
+    <main class="main-content">
+
+      <!-- Prompt area -->
+      <section class="prompt-section">
+        <div class="prompt-header">
+          <label for="prompt-textarea" class="section-label-main">
+            <span class="section-icon">💬</span> Your Prompt
+          </label>
+          <span class="char-count" id="char-count">0 chars</span>
+        </div>
+        <textarea id="prompt-textarea"
+          placeholder="Enter your question or topic for the AI models to debate…&#10;&#10;Examples:&#10;• Explain the pros and cons of using microservices vs monoliths&#10;• What's the best approach for handling state in React apps?&#10;• Write and critique a sorting algorithm in Python"
+          rows="6" spellcheck="true"></textarea>
+        <div class="prompt-actions">
+          <button id="run-btn" class="btn-run" disabled>
+            <span class="btn-run-icon">
+              <svg id="run-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              <svg id="spinner-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="display:none"><path d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke-dasharray="56" stroke-dashoffset="40"/></svg>
+            </span>
+            <span id="run-btn-text">Run Review Board</span>
+          </button>
+          <button id="stop-btn" class="btn-stop" style="display:none">
+            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+            Stop
+          </button>
+        </div>
+      </section>
+
+      <!-- Round progress (hidden until run) -->
+      <section class="round-progress" id="round-progress" style="display:none">
+        <div class="round-info">
+          <span class="round-label" id="round-label">Round 1 of 2</span>
+          <div class="round-dots" id="round-dots"></div>
+        </div>
+        <div class="progress-bar-track">
+          <div class="progress-bar-fill" id="progress-bar"></div>
+        </div>
+      </section>
+
+      <!-- Live feed (hidden until run) -->
+      <section class="live-feed" id="live-feed" style="display:none">
+        <div class="live-feed-header">
+          <h3 class="section-label-main"><span class="section-icon">📡</span> Live Feed</h3>
+          <span class="live-indicator" id="live-indicator">
+            <span class="live-dot"></span> LIVE
+          </span>
+        </div>
+        <div class="log-container" id="log-container" role="log" aria-live="polite"></div>
+      </section>
+
+      <!-- Streaming / Results grid (hidden until run) -->
+      <section class="results-section" id="results-section" style="display:none">
+        <div class="results-header">
+          <h3 class="section-label-main"><span class="section-icon">📋</span> Agent Responses</h3>
+          <div class="results-controls" id="results-controls" style="display:none">
+            <button class="btn-icon" id="toggle-markdown-btn" title="Toggle markdown rendering">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3v4a1 1 0 001 1h4"/><path d="M17 21H7a2 2 0 01-2-2V5a2 2 0 012-2h7l5 5v11a2 2 0 01-2 2z"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/><line x1="9" y1="9" x2="10" y2="9"/></svg>
+              Markdown
+            </button>
+          </div>
+        </div>
+        <div class="results-tabs" id="results-tabs" style="display:none"></div>
+        <div class="results-grid" id="results-grid"></div>
+        <div class="tab-content" id="tab-content" style="display:none"></div>
+      </section>
+
+      <!-- Empty state -->
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">🔍</div>
+        <h3>Ready to debate</h3>
+        <p>Configure your agents, enter a prompt, and watch multiple AI models debate and refine their answers in real time.</p>
+        <div class="empty-features">
+          <div class="feature-chip">⚡ Concurrent streaming</div>
+          <div class="feature-chip">🔄 Multi-round peer review</div>
+          <div class="feature-chip">📊 Side-by-side comparison</div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>Multi-Agent Review Board · Calls <a href="https://huggingface.co/docs/api-inference" target="_blank" rel="noopener">HF Inference API</a> directly from your browser · No data stored</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

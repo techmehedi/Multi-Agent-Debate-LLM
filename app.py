@@ -1,4 +1,7 @@
 import gradio as gr
+import os
+import time
+import random
 from huggingface_hub import InferenceClient, repo_exists
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -8,11 +11,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct-1M",
-    "google/gemma-2-2b-it",
+    "Qwen/Qwen2.5-7B-Instruct",
     "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "deepseek-ai/DeepSeek-R1",
-    "mistralai/Mistral-7B-Instruct-v0.3",
+    "meta-llama/Llama-3.2-3B-Instruct",
 ]
 
 DEFAULT_TEMP = 0.7
@@ -37,18 +38,73 @@ def generate_answer(
     messages: list[dict],
     temperature: float,
 ) -> str:
-    """Call the HF Inference API for a single agent turn."""
+    """Call the HF Inference API for a single agent turn, with retries."""
     client = InferenceClient(token=token, model=model)
-    response = client.chat_completion(
-        messages=messages,
-        max_tokens=2048,
-        temperature=temperature,
-        top_p=0.9,
+
+    max_tries = 4
+    base_sleep = 1.5
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_tries + 1):
+        try:
+            response = client.chat_completion(
+                messages=messages,
+                max_tokens=2048,
+                temperature=temperature,
+                top_p=0.9,
+            )
+            return response.choices[0].message.content
+
+        except Exception as e:
+            last_exc = e
+            msg = repr(e).lower()
+
+            # Treating these as transient: cold start, overloaded, gateway issues, timeouts
+            transient = any(
+                k in msg
+                for k in [
+                    "timeout",
+                    "timed out",
+                    "503",
+                    "502",
+                    "504",
+                    "429",
+                    "rate limited",
+                    "too many requests",
+                    "loading",
+                    "overloaded",
+                    "temporarily unavailable",
+                    "service unavailable",
+                    "gateway",
+                ]
+            )
+
+            # If not transient, or we exhausted retries, re-raise
+            if (not transient) or (attempt == max_tries):
+                raise
+
+            # Exponential backoff + small jitter
+            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+            time.sleep(sleep_s)
+
+    # Should never reach, but keeps type checkers happy
+    raise last_exc if last_exc else RuntimeError("Unknown inference failure")
+    
+def get_hf_token() -> str | None:
+    """
+    Resolve a Hugging Face token from multiple possible sources.
+    Priority:
+    1. HF_TOKEN (Space secret)
+    2. HUGGINGFACEHUB_API_TOKEN (older standard)
+    3. HF_OAUTH_ACCESS_TOKEN (OAuth injection)
+    """
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        or os.environ.get("HF_OAUTH_ACCESS_TOKEN")
     )
-    return response.choices[0].message.content
 
-
-def construct_review_message(other_responses: list[str]) -> dict:
+def construct_review_message(other_responses: list[tuple[str, str]]) -> dict:
     """Build a peer-review prompt containing the other agents' latest answers."""
     if not other_responses:
         return {
@@ -57,10 +113,11 @@ def construct_review_message(other_responses: list[str]) -> dict:
         }
 
     parts = ["These are the responses to the problem from other agents:\n"]
-    for i, resp in enumerate(other_responses, 1):
-        parts.append(f"Agent {i}'s response:\n```\n{resp}\n```\n")
+    for label, resp in other_responses:
+        parts.append(f"{label} response:\n```\n{resp}\n```\n")
     parts.append(
-        "Using the reasoning from other agents as additional advice, can you give an updated answer? Examine your solution and that of the other agents step by step. Provide your final, updated response."
+        "Using the reasoning from other agents as additional advice, update your answer. "
+        "Examine your solution and that of the other agents step by step. Provide your final, updated response."
     )
     return {"role": "user", "content": "\n".join(parts)}
 
@@ -97,6 +154,27 @@ def handle_inference_error(error: Exception, model_name: str) -> str:
         )
     return f"Error with '{model_name}': {raw[:300]}"
 
+def supports_chat_completion(model_id: str, token: str) -> tuple[bool, str]:
+    try:
+        client = InferenceClient(token=token, model=model_id)
+        client.chat_completion(
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        return True, ""
+    except Exception as e:
+        msg = handle_inference_error(e, model_id).strip().lower()
+
+        if "does not support chat completion" in msg:
+            return False, handle_inference_error(e, model_id)
+
+        if "access denied" in msg:
+            return False, handle_inference_error(e, model_id)
+
+        # Everything else might be transient (cold start, 429, 5xx)
+        return True, ""
 
 def validate_model(model_id: str, token: str | None = None) -> tuple[bool, str]:
     """Return *(ok, error_message)* after checking the model exists on the Hub."""
@@ -140,22 +218,27 @@ def run_review_board(
         yield f"**{tag}** -- Submitting requests...", None
 
         # After the first round, inject peer-review context
+# After the first round, ONLY inject peer-review context into agent 0 (critic)
         if round_num > 0:
             for i in range(num_agents):
-                others: list[str] = []
+                others: list[tuple[str, str]] = []
+
                 for j in range(num_agents):
                     if j == i:
                         continue
-                    # Grab the most recent assistant message from agent j
+
+                    label = f"Agent {j + 1} (id={agent_configs[j]['id']})"
                     for msg in reversed(agent_contexts[j]):
                         if msg["role"] == "assistant":
-                            others.append(msg["content"])
+                            others.append((label, msg["content"]))
                             break
+
                 agent_contexts[i].append(construct_review_message(others))
 
         # Fan out requests concurrently
         futures: dict = {}
-        with ThreadPoolExecutor(max_workers=num_agents) as pool:
+        max_workers = min(num_agents, 3)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
             for i, cfg in enumerate(agent_configs):
                 fut = pool.submit(
                     generate_answer,
@@ -193,7 +276,7 @@ def run_review_board(
             if msg["role"] == "assistant":
                 last = msg["content"]
                 break
-        results[f"Agent {i + 1}  --  {cfg['model']}"] = last
+        results[f"Agent {i + 1} (id={cfg['id']}) -- {cfg['model']}"] = last
 
     yield (
         "**Complete!** Select an agent tab below to view their final response.",
@@ -250,8 +333,8 @@ with gr.Blocks(
 ) as demo:
 
     # Shared state --------------------------------------------------------
-    agents_state = gr.State([0, 1])  # list of unique agent IDs
-    next_id_state = gr.State(2)  # counter for the next ID to assign
+    agents_state = gr.State([1, 2])
+    next_id_state = gr.State(3)  # counter for the next ID to assign
     results_state = gr.State({})  # final responses dict (empty until a run)
 
     # ---- Sidebar --------------------------------------------------------
@@ -328,11 +411,14 @@ with gr.Blocks(
                     sliders.append(temp)
 
             # ---- Wire the Run button (defined further below) ----
-            def on_run(data, hf_token: gr.OAuthToken | None = None):
-                if hf_token is None:
+            def on_run(data):
+                hf_token = get_hf_token()
+
+                if not hf_token:
                     raise gr.Error(
-                        "Please log in with your Hugging Face account first "
-                        "(use the Login button in the sidebar)."
+                        "No Hugging Face token found.\n\n"
+                        "Add an HF_TOKEN secret in the Space settings "
+                        "or enable OAuth with model access."
                     )
 
                 prompt = data[prompt_tb]
@@ -343,25 +429,35 @@ with gr.Blocks(
 
                 models = [data[dd] for dd in dropdowns]
                 temps = [data[sl] for sl in sliders]
-
-                # Build and validate agent configs
+                
+                agent_ids_local = list(agent_ids)  # stable IDs for this render
+                
                 configs: list[dict] = []
-                for i, (model, t) in enumerate(zip(models, temps)):
+                for i, (aid, model, t) in enumerate(zip(agent_ids_local, models, temps)):
                     if not model or not model.strip():
-                        raise gr.Error(
-                            f"Agent {i + 1}: please select or enter a model."
-                        )
+                        raise gr.Error(f"Agent {i + 1}: please select or enter a model.")
                     model = model.strip()
+                
                     if model not in DEFAULT_MODELS:
-                        ok, err = validate_model(model, hf_token.token)
+                        ok, err = validate_model(model, hf_token)
                         if not ok:
                             raise gr.Error(f"Agent {i + 1}: {err}")
-                    configs.append({"model": model, "temp": float(t)})
+                    
+                        ok, err = supports_chat_completion(model, hf_token)
+                        if not ok:
+                            raise gr.Error(f"Agent {i + 1}: {err}")
+                    else:
+                        #  Verify defaults are chat-compatible
+                        ok, err = supports_chat_completion(model, hf_token)
+                        if not ok:
+                            raise gr.Error(f"Agent {i + 1}: {err}")
+                                    
+                    configs.append({"id": aid, "model": model, "temp": float(t)})
 
                 # Stream progress as an accumulating log
                 log: list[str] = []
                 for status_line, results in run_review_board(
-                    prompt.strip(), configs, int(rounds), hf_token.token
+                    prompt.strip(), configs, int(rounds), hf_token
                 ):
                     log.append(status_line)
                     yield (
