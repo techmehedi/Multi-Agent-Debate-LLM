@@ -2,6 +2,9 @@ import gradio as gr
 import os
 import time
 import random
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from huggingface_hub import InferenceClient, repo_exists
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -24,6 +27,50 @@ SYSTEM_MESSAGE = (
     "responses in later rounds, carefully consider their reasoning and update "
     "your answer if you find compelling arguments."
 )
+
+HISTORY_FILE = Path(__file__).parent / "history.json"
+MAX_HISTORY_ITEMS = 100
+
+
+def load_history() -> list[dict]:
+    """Load persisted history records from disk."""
+    if not HISTORY_FILE.exists():
+        return []
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            items = payload.get("items", [])
+            return items if isinstance(items, list) else []
+        if isinstance(payload, list):
+            return payload
+        return []
+    except Exception:
+        return []
+
+
+def save_history(items: list[dict]) -> None:
+    """Persist history atomically to avoid partial writes."""
+    payload = {"version": 1, "items": items[-MAX_HISTORY_ITEMS:]}
+    tmp_path = HISTORY_FILE.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, HISTORY_FILE)
+
+
+def append_history_entry(entry: dict) -> list[dict]:
+    """Append one entry and return latest in-memory list."""
+    items = load_history()
+    items.append(entry)
+    save_history(items)
+    return items[-MAX_HISTORY_ITEMS:]
+
+
+def clear_history_store() -> list[dict]:
+    """Remove persisted history and return empty state."""
+    if HISTORY_FILE.exists():
+        HISTORY_FILE.unlink()
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +383,7 @@ with gr.Blocks(
     agents_state = gr.State([1, 2])
     next_id_state = gr.State(3)  # counter for the next ID to assign
     results_state = gr.State({})  # final responses dict (empty until a run)
+    history_state = gr.State(load_history())
 
     # ---- Sidebar --------------------------------------------------------
     with gr.Sidebar():
@@ -456,19 +504,40 @@ with gr.Blocks(
 
                 # Stream progress as an accumulating log
                 log: list[str] = []
+                latest_history = data[history_state]
                 for status_line, results in run_review_board(
                     prompt.strip(), configs, int(rounds), hf_token
                 ):
                     log.append(status_line)
+                    if results is not None:
+                        entry = {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "prompt": prompt.strip(),
+                            "rounds": int(rounds),
+                            "agents": [
+                                {
+                                    "id": cfg["id"],
+                                    "model": cfg["model"],
+                                    "temp": float(cfg["temp"]),
+                                }
+                                for cfg in configs
+                            ],
+                            "responses": results,
+                        }
+                        try:
+                            latest_history = append_history_entry(entry)
+                        except Exception as e:
+                            raise gr.Error(f"Failed to save history: {e}")
                     yield (
                         "\n\n".join(log),
                         results if results is not None else {},
+                        latest_history,
                     )
 
             run_btn.click(
                 on_run,
-                inputs={prompt_tb, num_rounds} | set(dropdowns) | set(sliders),
-                outputs=[status_md, results_state],
+                inputs={prompt_tb, num_rounds, history_state} | set(dropdowns) | set(sliders),
+                outputs=[status_md, results_state, history_state],
             )
 
         # "Add Agent" sits outside @gr.render so it stays at the bottom
@@ -497,6 +566,7 @@ with gr.Blocks(
     )
     run_btn = gr.Button("Run Review Board", variant="primary", size="lg")
     status_md = gr.Markdown("")
+    clear_history_btn = gr.Button("Clear History", variant="secondary", size="sm")
 
     # ---- Dynamic results tabs -------------------------------------------
     @gr.render(inputs=results_state)
@@ -509,6 +579,38 @@ with gr.Blocks(
             for name, response in results.items():
                 with gr.TabItem(name):
                     gr.Markdown(response)
+
+    gr.Markdown("---")
+    gr.Markdown("### Past Runs")
+
+    @gr.render(inputs=history_state)
+    def render_history(history_items):
+        if not history_items:
+            gr.Markdown("No history yet. Run the review board to save prompts and responses.")
+            return
+
+        for idx, item in enumerate(reversed(history_items), start=1):
+            ts = item.get("timestamp", "Unknown time")
+            prompt = item.get("prompt", "")
+            rounds = item.get("rounds", "?")
+            responses = item.get("responses", {})
+            with gr.Accordion(f"Run {idx} - {ts} (rounds: {rounds})", open=False):
+                gr.Markdown(f"**Prompt**\n\n{prompt}")
+                if responses:
+                    with gr.Tabs():
+                        for name, response in responses.items():
+                            with gr.TabItem(name):
+                                gr.Markdown(response)
+                else:
+                    gr.Markdown("No saved responses for this run.")
+
+    def on_clear_history():
+        try:
+            return clear_history_store()
+        except Exception as e:
+            raise gr.Error(f"Failed to clear history: {e}")
+
+    clear_history_btn.click(on_clear_history, outputs=[history_state])
 
 
 if __name__ == "__main__":
